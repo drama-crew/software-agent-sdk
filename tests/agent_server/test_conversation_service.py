@@ -35,6 +35,7 @@ from openhands.agent_server.models import (
 from openhands.agent_server.utils import safe_rmtree as _safe_rmtree
 from openhands.sdk import LLM, Agent, Message
 from openhands.sdk.agent.acp_agent import ACPAgent
+from openhands.sdk.conversation.request import SendMessageRequest
 from openhands.sdk.conversation.state import (
     ConversationExecutionStatus,
     ConversationState,
@@ -211,6 +212,56 @@ async def test_start_conversation_decrypts_encrypted_agent_settings_mcp_env(
         ]
         == "ghp-plaintext"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_flag", [False, True])
+async def test_start_conversation_honors_initial_message_run(
+    conversation_service, tmp_path, run_flag
+):
+    """start_conversation must deliver the initial message using the caller's
+    ``run`` flag, not a hardcoded ``True``.
+
+    With ``run=False`` the agent receives the bootstrap message as context but
+    does not auto-run; it waits for the user's first instruction.
+    """
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+    request = StartConversationRequest(
+        agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+        workspace=LocalWorkspace(working_dir=str(workspace_dir)),
+        confirmation_policy=NeverConfirm(),
+        initial_message=SendMessageRequest(
+            role="user",
+            content=[TextContent(text="bootstrap context")],
+            run=run_flag,
+        ),
+    )
+
+    captured_service = AsyncMock(spec=EventService)
+
+    async def fake_start_event_service(stored: StoredConversation):
+        captured_service.stored = stored
+        captured_service.get_state.return_value = ConversationState(
+            id=stored.id,
+            agent=stored.agent,
+            workspace=stored.workspace,
+            execution_status=ConversationExecutionStatus.IDLE,
+            confirmation_policy=stored.confirmation_policy,
+        )
+        return captured_service
+
+    with patch.object(
+        conversation_service,
+        "_start_event_service",
+        side_effect=fake_start_event_service,
+    ):
+        await conversation_service.start_conversation(request)
+
+    captured_service.send_message.assert_awaited_once()
+    # send_message(message, run) — the second positional arg is the run flag.
+    await_args = captured_service.send_message.await_args
+    assert await_args.args[1] is run_flag
 
 
 @pytest.mark.asyncio

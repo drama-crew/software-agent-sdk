@@ -679,7 +679,10 @@ class ConversationService:
             message = Message(
                 role=initial_message.role, content=initial_message.content
             )
-            await event_service.send_message(message, True)
+            # Honor the caller's ``run`` flag instead of forcing the agent to
+            # run. With ``run=False`` the initial message is delivered as
+            # context but the agent waits for the user's first instruction.
+            await event_service.send_message(message, initial_message.run)
 
         state = await event_service.get_state()
         conversation_info = _compose_conversation_info(event_service.stored, state)
