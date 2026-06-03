@@ -119,6 +119,25 @@ def _acp_session_kind(agent_name: str) -> str:
     return slug or "unknown"
 
 
+def _merge_acp_session(
+    agent_state: dict,
+    *,
+    kind: str,
+    session_id: str | None,
+    cwd: str | None,
+) -> dict:
+    """Return a new agent_state with (kind -> {id, cwd}) recorded in 'acp_sessions',
+    keeping legacy single-value keys for back-compat read."""
+    sessions = dict(agent_state.get("acp_sessions") or {})
+    sessions[kind] = {"id": session_id, "cwd": cwd}
+    return {
+        **agent_state,
+        "acp_sessions": sessions,
+        "acp_session_id": session_id,
+        "acp_session_cwd": cwd,
+    }
+
+
 if TYPE_CHECKING:
     from openhands.sdk.conversation import (
         ConversationCallbackType,
@@ -1428,12 +1447,17 @@ class ACPAgent(AgentBase):
         # in a different working directory would at best silently miss the
         # prior session and at worst load a different session that happens to
         # exist at the new cwd.
+        kind = _acp_session_kind(self._agent_name)
+        merged = _merge_acp_session(
+            state.agent_state,
+            kind=kind,
+            session_id=self._session_id,
+            cwd=self._working_dir,
+        )
         new_agent_state = {
-            **state.agent_state,
+            **merged,
             "acp_agent_name": self._agent_name,
             "acp_agent_version": self._agent_version,
-            "acp_session_id": self._session_id,
-            "acp_session_cwd": self._working_dir,
             # Static provider capability — persisted so cold reads of the
             # conversation list can tell the picker whether to offer live
             # switching without re-detecting the provider server-side.
