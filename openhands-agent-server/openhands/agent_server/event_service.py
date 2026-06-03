@@ -764,6 +764,7 @@ class EventService:
             hook_config=self.stored.hook_config,
             tags=self.stored.tags,
             user_id=self.stored.user_id,
+            agent_state=self.stored.agent_state,
         )
 
         conversation.set_confirmation_policy(self.stored.confirmation_policy)

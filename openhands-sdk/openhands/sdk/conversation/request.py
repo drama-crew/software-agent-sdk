@@ -199,6 +199,12 @@ class StartConversationRequest(BaseModel):
         ),
     )
 
+    agent_state: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional initial agent-specific runtime state seeded into a NEW "
+        "conversation's ConversationState.agent_state (e.g. ACP session map for resume "
+        "after a sandbox rebuild). Ignored if the conversation already has persisted state.",
+    )
     agent_settings: dict[str, Any] | None = Field(
         default=None,
         exclude=True,

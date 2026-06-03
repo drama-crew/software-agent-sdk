@@ -3043,3 +3043,48 @@ async def test_run_false_message_in_cleanup_tail_is_not_run(
         f"(call_count={parent_llm._call_count})"
     )
     assert es._run_task is None
+
+
+class TestEventServiceStartSeedsAgentState:
+    """Test that EventService.start() passes agent_state from StoredConversation
+    into LocalConversation so ConversationState.create() can seed it."""
+
+    @pytest.mark.asyncio
+    async def test_start_conversation_seeds_agent_state(self, tmp_path):
+        """agent_state from StoredConversation is forwarded to LocalConversation."""
+        seed = {"acp_sessions": {"opencode": {"id": "seed", "cwd": "/w"}}}
+        stored = StoredConversation(
+            id=uuid4(),
+            agent=Agent(llm=LLM(model="gpt-4o", usage_id="test-llm"), tools=[]),
+            workspace=LocalWorkspace(working_dir=str(tmp_path)),
+            confirmation_policy=NeverConfirm(),
+            initial_message=None,
+            metrics=None,
+            agent_state=seed,
+        )
+
+        service = EventService(stored=stored, conversations_dir=tmp_path)
+        conv_dir = tmp_path / stored.id.hex
+        conv_dir.mkdir(parents=True, exist_ok=True)
+
+        with patch(
+            "openhands.agent_server.event_service.LocalConversation"
+        ) as MockConversation:
+            mock_conv = MagicMock()
+            mock_state = MagicMock()
+            mock_agent = MagicMock()
+            mock_state.execution_status = ConversationExecutionStatus.IDLE
+            mock_state.events = []
+            mock_state.stats = MagicMock()
+            mock_agent.get_all_llms.return_value = []
+            mock_conv._state = mock_state
+            mock_conv.state = mock_state
+            mock_conv.agent = mock_agent
+            mock_conv._on_event = MagicMock()
+            MockConversation.return_value = mock_conv
+
+            await service.start()
+
+            # LocalConversation must have been called with agent_state=seed
+            _, kwargs = MockConversation.call_args
+            assert kwargs.get("agent_state") == seed
