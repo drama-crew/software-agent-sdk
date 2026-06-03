@@ -20,6 +20,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -91,6 +92,31 @@ from openhands.sdk.utils.pydantic_secrets import (
 
 logger = get_logger(__name__)
 maybe_init_laminar()
+
+# ---------------------------------------------------------------------------
+# Per-kind ACP session map helpers
+# ---------------------------------------------------------------------------
+
+_ACP_KIND_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("claude", "claude"),
+    ("anthropic", "claude"),
+    ("opencode", "opencode"),
+    ("hermes", "hermes"),
+    ("codex", "codex"),
+    ("gemini", "gemini"),
+)
+
+
+def _acp_session_kind(agent_name: str) -> str:
+    """Normalize a runtime ACP agent name to a stable per-kind key used to bucket
+    session ids in agent_state['acp_sessions']. Known agents map to a canonical key;
+    unknown names fall back to a slug; empty -> 'unknown'."""
+    lower = (agent_name or "").lower()
+    for needle, kind in _ACP_KIND_PATTERNS:
+        if needle in lower:
+            return kind
+    slug = re.sub(r"[^a-z0-9]+", "-", lower).strip("-")
+    return slug or "unknown"
 
 
 if TYPE_CHECKING:
