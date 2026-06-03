@@ -44,3 +44,31 @@ def test_merge_second_kind_does_not_clobber_first():
     assert out["acp_sessions"]["opencode"] == {"id": "s1", "cwd": "/w"}
     assert out["acp_sessions"]["claude"] == {"id": "s2", "cwd": "/w"}
     assert out["acp_session_id"] == "s2"
+
+
+# ---------------------------------------------------------------------------
+# Task 1.3 — _read_prior_acp_session
+# ---------------------------------------------------------------------------
+
+from openhands.sdk.agent.acp_agent import _read_prior_acp_session  # noqa: E402
+
+
+def test_read_prefers_per_kind():
+    st = {
+        "acp_sessions": {"opencode": {"id": "s1", "cwd": "/w"}},
+        "acp_session_id": "LEGACY",
+        "acp_session_cwd": "/old",
+    }
+    sid, cwd = _read_prior_acp_session(st, kind="opencode")
+    assert sid == "s1" and cwd == "/w"
+
+
+def test_read_falls_back_to_legacy_when_kind_absent():
+    st = {"acp_session_id": "LEGACY", "acp_session_cwd": "/old"}
+    sid, cwd = _read_prior_acp_session(st, kind="opencode")
+    assert sid == "LEGACY" and cwd == "/old"
+
+
+def test_read_returns_none_when_nothing():
+    sid, cwd = _read_prior_acp_session({}, kind="opencode")
+    assert sid is None and cwd is None

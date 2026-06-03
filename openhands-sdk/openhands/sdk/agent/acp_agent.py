@@ -138,6 +138,20 @@ def _merge_acp_session(
     }
 
 
+def _read_prior_acp_session(
+    agent_state: dict,
+    *,
+    kind: str,
+) -> tuple[str | None, str | None]:
+    """Read prior (session_id, cwd) for this kind, preferring per-kind 'acp_sessions'
+    map and falling back to legacy single-value keys."""
+    sessions = agent_state.get("acp_sessions") or {}
+    entry = sessions.get(kind)
+    if entry:
+        return entry.get("id"), entry.get("cwd")
+    return agent_state.get("acp_session_id"), agent_state.get("acp_session_cwd")
+
+
 if TYPE_CHECKING:
     from openhands.sdk.conversation import (
         ConversationCallbackType,
@@ -1393,7 +1407,9 @@ class ACPAgent(AgentBase):
         # A prior session id in agent_state means we may be resuming; used by
         # ``truly_resumed`` below to decide whether the model state reported
         # for this launch describes the resumed session or a fresh one.
-        prior_session_id = state.agent_state.get("acp_session_id")
+        # Use per-kind map when available, fall back to legacy keys.
+        _init_kind = _acp_session_kind(self._agent_name) if self._agent_name else _acp_session_kind(str(self.acp_command[-1]))
+        prior_session_id, _ = _read_prior_acp_session(state.agent_state, kind=_init_kind)
         # ``acp_suffix_installed`` is persisted by
         # ``_commit_suffix_installation`` only after the first prompt has
         # actually returned successfully, so on resume we know whether the
@@ -1601,8 +1617,10 @@ class ACPAgent(AgentBase):
         # ACP servers key persistence by ``cwd``; if the workspace moved we
         # drop the id so we don't accidentally resume (or silently load) a
         # session the server associates with a different directory.
-        prior_session_id: str | None = state.agent_state.get("acp_session_id")
-        prior_session_cwd: str | None = state.agent_state.get("acp_session_cwd")
+        # self._agent_name is empty here (set only after _init completes), so
+        # fall back to the last element of acp_command as the kind hint.
+        _kind = _acp_session_kind(self._agent_name) if self._agent_name else _acp_session_kind(str(self.acp_command[-1]))
+        prior_session_id, prior_session_cwd = _read_prior_acp_session(state.agent_state, kind=_kind)
         if prior_session_id is not None and prior_session_cwd not in (
             None,
             working_dir,
