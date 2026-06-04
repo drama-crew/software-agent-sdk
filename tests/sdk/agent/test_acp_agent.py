@@ -13,7 +13,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from acp.exceptions import RequestError as ACPRequestError
-from acp.schema import PromptResponse
+from acp.schema import (
+    AllowedOutcome,
+    DeniedOutcome,
+    PromptResponse,
+    RequestPermissionResponse,
+)
 from pydantic import SecretStr
 
 from openhands.sdk.agent.acp_agent import (
@@ -72,6 +77,16 @@ def _make_state(tmp_path) -> ConversationState:
         agent=agent,
         workspace=workspace,
     )
+
+
+async def _wait_for_status(
+    state: ConversationState, status: ConversationExecutionStatus
+) -> None:
+    for _ in range(10):
+        if state.execution_status == status:
+            return
+        await asyncio.sleep(0)
+    assert state.execution_status == status
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +829,41 @@ class TestOpenHandsACPClient:
         assert tokens == ["chunk1"]
 
     @pytest.mark.asyncio
+    async def test_request_permission_delegates_to_permission_handler(self):
+        client = _OpenHandsACPBridge()
+
+        async def _handler(options, session_id, tool_call):
+            assert options[0].option_id == "auto-allow"
+            assert session_id == "session-1"
+            assert tool_call.title == "bash"
+            return RequestPermissionResponse(
+                outcome=AllowedOutcome(outcome="selected", option_id="ui-allow")
+            )
+
+        client.on_permission_request = _handler
+
+        response = await client.request_permission(
+            [MagicMock(option_id="auto-allow")],
+            "session-1",
+            MagicMock(title="bash"),
+        )
+
+        assert response.outcome.option_id == "ui-allow"
+
+    @pytest.mark.asyncio
+    async def test_request_permission_without_handler_does_not_auto_approve(self):
+        client = _OpenHandsACPBridge()
+
+        response = await client.request_permission(
+            [MagicMock(option_id="allow_once")],
+            "session-1",
+            MagicMock(title="bash"),
+        )
+
+        assert isinstance(response.outcome, DeniedOutcome)
+        assert response.outcome.outcome == "cancelled"
+
+    @pytest.mark.asyncio
     async def test_fs_methods_raise(self):
         client = _OpenHandsACPBridge()
         with pytest.raises(NotImplementedError):
@@ -1050,6 +1100,99 @@ class TestACPActivityHeartbeat:
         # And that it was cleared afterward so a late session_update
         # cannot fire the per-turn heartbeat callback out-of-band.
         assert agent._client.on_activity is None
+
+
+class TestACPAgentPermissionConfirmation:
+    @staticmethod
+    def _permission_option(option_id: str, kind: str):
+        option = MagicMock()
+        option.option_id = option_id
+        option.kind = kind
+        option.name = option_id
+        return option
+
+    @staticmethod
+    def _tool_call():
+        tool_call = MagicMock()
+        tool_call.tool_call_id = "tool-call-1"
+        tool_call.title = "bash"
+        tool_call.kind = "execute"
+        tool_call.raw_input = {"command": "echo ok"}
+        tool_call.content = None
+        return tool_call
+
+    @pytest.mark.asyncio
+    async def test_permission_request_waits_for_ui_accept(self, tmp_path):
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+        events: list = []
+
+        task = asyncio.create_task(
+            agent._handle_permission_request(
+                options=[
+                    self._permission_option("allow-once", "allow_once"),
+                    self._permission_option("reject-once", "reject_once"),
+                ],
+                session_id="session-1",
+                tool_call=self._tool_call(),
+                state=state,
+                on_event=events.append,
+            )
+        )
+
+        await _wait_for_status(
+            state, ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+
+        assert not task.done()
+        assert any(
+            isinstance(event, ACPToolCallEvent)
+            and event.tool_call_id == "tool-call-1"
+            and event.title == "bash"
+            and event.status == "pending"
+            for event in events
+        )
+
+        assert agent.respond_to_pending_acp_permission(accept=True) is True
+
+        response = await asyncio.wait_for(task, timeout=1.0)
+
+        assert response.outcome.outcome == "selected"
+        assert response.outcome.option_id == "allow-once"
+        assert state.execution_status == ConversationExecutionStatus.RUNNING
+        assert agent.respond_to_pending_acp_permission(accept=True) is False
+
+    @pytest.mark.asyncio
+    async def test_permission_request_reject_selects_reject_option(self, tmp_path):
+        agent = _make_agent()
+        state = _make_state(tmp_path)
+
+        task = asyncio.create_task(
+            agent._handle_permission_request(
+                options=[
+                    self._permission_option("allow-once", "allow_once"),
+                    self._permission_option("reject-once", "reject_once"),
+                ],
+                session_id="session-1",
+                tool_call=self._tool_call(),
+                state=state,
+                on_event=lambda _event: None,
+            )
+        )
+
+        await _wait_for_status(
+            state, ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+        )
+
+        assert (
+            agent.respond_to_pending_acp_permission(accept=False, reason="not safe")
+            is True
+        )
+
+        response = await asyncio.wait_for(task, timeout=1.0)
+
+        assert response.outcome.outcome == "selected"
+        assert response.outcome.option_id == "reject-once"
 
 
 # ---------------------------------------------------------------------------

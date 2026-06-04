@@ -1,3 +1,9 @@
+from openhands.sdk.event.acp_plan import (
+    AgentPlanEntry,
+    AgentPlanEvent,
+    AvailableCommandInfo,
+    AvailableCommandsEvent,
+)
 from openhands.sdk.event.acp_tool_call import ACPToolCallEvent
 from openhands.sdk.event.base import Event, LLMConvertibleEvent
 from openhands.sdk.event.condenser import (
@@ -30,6 +36,10 @@ from openhands.sdk.event.user_action import InterruptEvent, PauseEvent
 
 __all__ = [
     "ACPToolCallEvent",
+    "AgentPlanEvent",
+    "AgentPlanEntry",
+    "AvailableCommandsEvent",
+    "AvailableCommandInfo",
     "Event",
     "LLMConvertibleEvent",
     "SystemPromptEvent",

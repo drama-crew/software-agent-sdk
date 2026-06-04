@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Unified ACP entrypoint for the multi-agent sandbox image.
+#
+# Selects which coding agent to launch as an ACP (Agent Client Protocol) stdio
+# server. Pick the agent with the first argument or the $ACP_AGENT env var:
+#
+#   oh-acp-agent claude-code      # Anthropic Claude Code   (claude-agent-acp)
+#   oh-acp-agent opencode         # OpenCode                (opencode acp)
+#   oh-acp-agent hermes           # NousResearch Hermes     (hermes acp)
+#
+# Used as an OpenHands ACP command, e.g.:
+#   acp_command = ["oh-acp-agent", "opencode"]
+#
+# OpenHands injects credentials via the sandbox container env. OpenCode can read
+# OpenAI env vars through OPENCODE_CONFIG_CONTENT; Hermes needs config.yaml for
+# its primary model endpoint, so the launcher writes that from OPENAI_* at start.
+set -euo pipefail
+AGENT="${1:-${ACP_AGENT:-claude-code}}"
+
+require_env() {
+  local missing=0 name
+  for name in "$@"; do
+    if [ -z "${!name:-}" ]; then
+      echo "oh-acp-agent: $name must be set for $AGENT" >&2
+      missing=1
+    fi
+  done
+  [ "$missing" = 0 ] || exit 2
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+yaml_double_quote_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+configure_opencode_openai() {
+  require_env OPENAI_BASE_URL OPENAI_API_KEY
+
+  if [ -z "${OPENCODE_CONFIG_CONTENT:-}" ]; then
+    local model model_json
+    model="${OPENCODE_MODEL:-gpt-5.5}"
+    model="${model#openai/}"
+    model_json="$(json_escape "$model")"
+
+    export OPENCODE_CONFIG_CONTENT
+    OPENCODE_CONFIG_CONTENT="$(printf '{"$schema":"https://opencode.ai/config.json","enabled_providers":["openai"],"model":"openai/%s","small_model":"openai/%s","permission":{"bash":{"*":"ask"}},"provider":{"openai":{"options":{"baseURL":"{env:OPENAI_BASE_URL}","apiKey":"{env:OPENAI_API_KEY}"},"models":{"%s":{"name":"%s"}}}}}' "$model_json" "$model_json" "$model_json" "$model_json")"
+  fi
+}
+
+configure_hermes_openai() {
+  require_env OPENAI_BASE_URL OPENAI_API_KEY
+
+  local hermes_home config_path model base_url api_key
+  hermes_home="${HOME:-/home/openhands}/.hermes"
+  config_path="$hermes_home/config.yaml"
+  model="$(yaml_double_quote_escape "${HERMES_MODEL:-gpt-5.5}")"
+  base_url="$(yaml_double_quote_escape "$OPENAI_BASE_URL")"
+  api_key="$(yaml_double_quote_escape "$OPENAI_API_KEY")"
+
+  mkdir -p "$hermes_home"
+  chmod 700 "$hermes_home" 2>/dev/null || true
+  umask 077
+  cat >"$config_path" <<EOF
+model:
+  default: "$model"
+  provider: "custom"
+  base_url: "$base_url"
+  api_key: "$api_key"
+EOF
+  chmod 600 "$config_path" 2>/dev/null || true
+}
+
+case "$AGENT" in
+  claude|claude-code|anthropic)
+    exec claude-agent-acp
+    ;;
+  opencode)
+    configure_opencode_openai
+    exec opencode acp
+    ;;
+  hermes)
+    configure_hermes_openai
+    exec hermes acp
+    ;;
+  *)
+    echo "oh-acp-agent: unknown agent '$AGENT' (use: claude-code | opencode | hermes)" >&2
+    exit 2
+    ;;
+esac

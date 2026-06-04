@@ -964,6 +964,17 @@ class EventService:
             self._run_task = asyncio.create_task(_run_and_publish())
 
     async def respond_to_confirmation(self, request: ConfirmationResponseRequest):
+        if (
+            self._conversation
+            and isinstance(self._conversation.agent, ACPAgent)
+            and self._conversation.respond_to_pending_acp_permission(
+                accept=request.accept,
+                reason=request.reason,
+                tool_call_id=request.tool_call_id,
+            )
+        ):
+            return
+
         if request.accept:
             try:
                 await self.run()

@@ -317,6 +317,7 @@ class ConfirmationResponseRequest(BaseModel):
 
     accept: bool
     reason: str = "User rejected the action."
+    tool_call_id: str | None = None  # target one pending permission; None = all
 
 
 class Success(BaseModel):

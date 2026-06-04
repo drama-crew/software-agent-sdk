@@ -33,8 +33,11 @@ from acp.exceptions import RequestError as ACPRequestError
 from acp.helpers import image_block, text_block
 from acp.schema import (
     AgentMessageChunk,
+    AgentPlanUpdate,
     AgentThoughtChunk,
     AllowedOutcome,
+    AvailableCommandsUpdate,
+    DeniedOutcome,
     ImageContentBlock,
     PromptResponse,
     RequestPermissionResponse,
@@ -60,6 +63,10 @@ from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.event import (
     ACPToolCallEvent,
     ActionEvent,
+    AgentPlanEntry,
+    AgentPlanEvent,
+    AvailableCommandInfo,
+    AvailableCommandsEvent,
     MessageEvent,
     ObservationEvent,
     SystemPromptEvent,
@@ -172,6 +179,92 @@ class _PromptDrainResult(NamedTuple):
     completed: bool
     response: PromptResponse | None
     error: BaseException | None
+
+
+class _PendingACPPermission(NamedTuple):
+    response_future: Future[RequestPermissionResponse]
+    options: list[Any]
+    tool_call_id: str
+
+
+_MISSING: Any = object()
+
+
+def _acp_value(obj: Any, *names: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        for name in names:
+            if name in obj:
+                return obj[name]
+        return default
+
+    values = getattr(obj, "__dict__", {})
+    if isinstance(values, dict):
+        for name in names:
+            if name in values:
+                return values[name]
+
+    for name in names:
+        value = getattr(obj, name, _MISSING)
+        if value is not _MISSING:
+            return value
+    return default
+
+
+def _permission_option_id(option: Any) -> str | None:
+    option_id = _acp_value(option, "option_id", "optionId")
+    return option_id if isinstance(option_id, str) else None
+
+
+def _permission_option_kind(option: Any) -> str | None:
+    kind = _acp_value(option, "kind")
+    return kind if isinstance(kind, str) else None
+
+
+def _select_permission_option_id(options: list[Any], *, accept: bool) -> str | None:
+    desired_prefix = "allow" if accept else "reject"
+    for option in options:
+        kind = _permission_option_kind(option)
+        if kind is not None and kind.startswith(desired_prefix):
+            return _permission_option_id(option)
+
+    if accept and options:
+        return _permission_option_id(options[0])
+    return None
+
+
+# Tool kinds auto-approved under 'auto_approve_edits_only'. Destructive or
+# outbound kinds (execute / fetch / other) still require explicit approval.
+_EDITS_ONLY_AUTO_KINDS = frozenset({"edit", "read"})
+
+
+def _auto_permission_decision(
+    approval_mode: str, tool_kind: str | None
+) -> bool | None:
+    """Decide a permission request without the UI based on ``approval_mode``.
+
+    Returns ``True`` to auto-approve, ``False`` to auto-reject, or ``None`` to
+    fall through to the interactive UI flow.
+    """
+    if approval_mode == "auto_approve_all":
+        return True
+    if approval_mode == "reject_all":
+        return False
+    if approval_mode == "auto_approve_edits_only":
+        if tool_kind in _EDITS_ONLY_AUTO_KINDS:
+            return True
+        return None
+    # 'ask_always' or any unknown value → defer to the user.
+    return None
+
+
+def _cancelled_permission_response() -> RequestPermissionResponse:
+    return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+
+
+def _selected_permission_response(option_id: str) -> RequestPermissionResponse:
+    return RequestPermissionResponse(
+        outcome=AllowedOutcome(outcome="selected", option_id=option_id),
+    )
 
 
 # Stable identifier stamped onto the sentinel LLM so downstream code
@@ -547,6 +640,9 @@ class _OpenHandsACPBridge:
         # signal that the ACP subprocess is still actively working.  Set by
         # ACPAgent.step() to keep the agent-server's idle timer alive.
         self.on_activity: Any = None  # Callable[[], None] | None
+        # Permission request sink — set by ACPAgent.astep() for UI-backed
+        # turns so session/request_permission waits for user confirmation.
+        self.on_permission_request: Any = None
         self._last_activity_signal: float = float("-inf")
         # Telemetry state from UsageUpdate (persists across turns)
         self._last_cost: float = 0.0  # last cumulative cost seen
@@ -569,6 +665,7 @@ class _OpenHandsACPBridge:
         self.on_token = None
         self.on_event = None
         self.on_activity = None
+        self.on_permission_request = None
         self._turn_usage_updates.clear()
         self._usage_received.clear()
         # Note: telemetry state (_last_cost, _context_window, _last_activity_signal,
@@ -665,8 +762,57 @@ class _OpenHandsACPBridge:
             if target is not None:
                 self._emit_tool_call_event(target)
             self._maybe_signal_activity()
+        elif isinstance(update, AgentPlanUpdate):
+            logger.debug("ACP plan update: %d entries", len(update.entries))
+            self._emit_plan_event(update)
+            self._maybe_signal_activity()
+        elif isinstance(update, AvailableCommandsUpdate):
+            logger.debug(
+                "ACP available commands update: %d commands",
+                len(update.available_commands),
+            )
+            self._emit_available_commands_event(update)
+            self._maybe_signal_activity()
         else:
             logger.debug("ACP session update: %s", type(update).__name__)
+
+    def _emit_plan_event(self, update: AgentPlanUpdate) -> None:
+        """Emit an ``AgentPlanEvent`` from an ACP plan update.
+
+        The agent re-sends the full plan on every change; consumers dedupe by
+        treating the latest event as the current plan.
+        """
+        if self.on_event is None:
+            return
+        try:
+            entries = [
+                AgentPlanEntry(
+                    content=entry.content,
+                    priority=str(entry.priority)
+                    if entry.priority is not None
+                    else None,
+                    status=str(entry.status) if entry.status is not None else None,
+                )
+                for entry in update.entries
+            ]
+            self.on_event(AgentPlanEvent(entries=entries))
+        except Exception:
+            logger.debug("Failed to emit AgentPlanEvent", exc_info=True)
+
+    def _emit_available_commands_event(
+        self, update: AvailableCommandsUpdate
+    ) -> None:
+        """Emit an ``AvailableCommandsEvent`` from an ACP commands update."""
+        if self.on_event is None:
+            return
+        try:
+            commands = [
+                AvailableCommandInfo(name=cmd.name, description=cmd.description)
+                for cmd in update.available_commands
+            ]
+            self.on_event(AvailableCommandsEvent(commands=commands))
+        except Exception:
+            logger.debug("Failed to emit AvailableCommandsEvent", exc_info=True)
 
     def _emit_tool_call_event(self, tc: dict[str, Any]) -> None:
         """Emit an ACPToolCallEvent reflecting the current state of ``tc``.
@@ -723,21 +869,24 @@ class _OpenHandsACPBridge:
     async def request_permission(
         self,
         options: list[Any],
-        session_id: str,  # noqa: ARG002
+        session_id: str,
         tool_call: Any,
         **kwargs: Any,  # noqa: ARG002
     ) -> Any:
-        """Auto-approve all permission requests from the ACP server."""
-        # Pick the first option (usually "allow once")
-        option_id = options[0].option_id if options else "allow_once"
-        logger.info(
-            "ACP auto-approving permission: %s (option: %s)",
+        """Handle permission requests from the ACP server."""
+        if self.on_permission_request is not None:
+            logger.info("ACP forwarding permission request to UI: %s", tool_call)
+            result = self.on_permission_request(options, session_id, tool_call)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        logger.warning(
+            "ACP permission request denied because no UI confirmation handler "
+            "is configured: %s",
             tool_call,
-            option_id,
         )
-        return RequestPermissionResponse(
-            outcome=AllowedOutcome(outcome="selected", option_id=option_id),
-        )
+        return _cancelled_permission_response()
 
     # fs/terminal methods — raise NotImplementedError; ACP server handles its own
     async def write_text_file(
@@ -892,6 +1041,24 @@ class ACPAgent(AgentBase):
             "If None, the server picks its default."
         ),
     )
+    acp_approval_mode: Literal[
+        "ask_always",
+        "auto_approve_all",
+        "auto_approve_edits_only",
+        "reject_all",
+    ] = Field(
+        default="ask_always",
+        description=(
+            "How ACP permission requests ('Continue?') are answered:\n"
+            "- 'ask_always' (default): surface every request to the UI and wait "
+            "for the user (current behaviour).\n"
+            "- 'auto_approve_all': approve every request without prompting "
+            "(smooth to-C flow; the agent acts unattended).\n"
+            "- 'auto_approve_edits_only': auto-approve non-destructive tool "
+            "kinds (edit, read) and still ask for 'execute'/'fetch'/'other'.\n"
+            "- 'reject_all': auto-reject every request (safety / testing)."
+        ),
+    )
 
     def model_post_init(self, __context: object) -> None:
         super().model_post_init(__context)
@@ -963,6 +1130,12 @@ class ACPAgent(AgentBase):
     _installed_suffix: str | None = PrivateAttr(default=None)
     _restart_session_on_next_turn: bool = PrivateAttr(default=False)
     _resumed_existing_session: bool = PrivateAttr(default=False)
+    _pending_acp_permissions: dict[str, _PendingACPPermission] = PrivateAttr(
+        default_factory=dict
+    )
+    _pending_acp_permission_lock: threading.Lock = PrivateAttr(
+        default_factory=threading.Lock
+    )
 
     # -- Helpers -----------------------------------------------------------
 
@@ -1593,10 +1766,141 @@ class ACPAgent(AgentBase):
         ) = self._executor.run_async(_init)
         self._working_dir = working_dir
 
+    async def _handle_permission_request(
+        self,
+        options: list[Any],
+        session_id: str,
+        tool_call: Any,
+        state: ConversationState,
+        on_event: ConversationCallbackType,
+    ) -> RequestPermissionResponse:
+        """Surface an ACP permission request through OpenHands confirmation UI.
+
+        When ``acp_approval_mode`` is an auto mode the request is answered here
+        without touching the UI or the WAITING_FOR_CONFIRMATION state, so the
+        agent proceeds (or is rejected) without a per-action prompt.
+        """
+        tool_kind = _acp_value(tool_call, "kind", "tool_kind", "toolKind")
+        auto = _auto_permission_decision(self.acp_approval_mode, tool_kind)
+        if auto is not None:
+            option_id = _select_permission_option_id(list(options), accept=auto)
+            logger.info(
+                "ACP permission auto-%s (mode=%s, kind=%s)",
+                "approved" if auto else "rejected",
+                self.acp_approval_mode,
+                tool_kind,
+            )
+            if option_id is not None:
+                return _selected_permission_response(option_id)
+            return _cancelled_permission_response()
+
+        tool_call_id = _acp_value(
+            tool_call,
+            "tool_call_id",
+            "toolCallId",
+            default=str(uuid.uuid4()),
+        )
+        response_future: Future[RequestPermissionResponse] = Future()
+        pending = _PendingACPPermission(
+            response_future=response_future,
+            options=list(options),
+            tool_call_id=tool_call_id,
+        )
+
+        with self._pending_acp_permission_lock:
+            # Insert by id; do NOT cancel other pending requests.
+            self._pending_acp_permissions[tool_call_id] = pending
+
+        title = _acp_value(tool_call, "title", default=None) or "Permission request"
+        raw_input = _acp_value(tool_call, "raw_input", "rawInput")
+        content = _serialize_tool_content(_acp_value(tool_call, "content"))
+
+        logger.info(
+            "ACP permission request waiting for UI confirmation: %s (%s)",
+            title,
+            session_id,
+        )
+
+        with state:
+            state.execution_status = (
+                ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+            )
+            on_event(
+                ACPToolCallEvent(
+                    tool_call_id=tool_call_id,
+                    title=title,
+                    status="pending",
+                    tool_kind=tool_kind,
+                    raw_input=raw_input,
+                    content=content,
+                )
+            )
+
+        try:
+            return await asyncio.wrap_future(response_future)
+        finally:
+            with self._pending_acp_permission_lock:
+                self._pending_acp_permissions.pop(tool_call_id, None)
+            with state:
+                # Re-check emptiness under both locks so a request arriving
+                # in the gap between pop and the state flip is not clobbered
+                # back to RUNNING while genuinely pending.
+                with self._pending_acp_permission_lock:
+                    still_empty = not self._pending_acp_permissions
+                if (
+                    still_empty
+                    and state.execution_status
+                    == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION
+                ):
+                    state.execution_status = ConversationExecutionStatus.RUNNING
+
+    def respond_to_pending_acp_permission(
+        self,
+        *,
+        accept: bool | None,
+        reason: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> bool:
+        """Resolve one pending ACP permission (by tool_call_id) or all (id=None)."""
+        with self._pending_acp_permission_lock:
+            if tool_call_id is not None:
+                p = self._pending_acp_permissions.get(tool_call_id)
+                targets = [p] if p and not p.response_future.done() else []
+            else:
+                targets = [
+                    p
+                    for p in self._pending_acp_permissions.values()
+                    if not p.response_future.done()
+                ]
+            if not targets:
+                return False
+            for p in targets:
+                if accept is None:
+                    response = _cancelled_permission_response()
+                else:
+                    option_id = _select_permission_option_id(
+                        p.options,
+                        accept=accept,
+                    )
+                    response = (
+                        _selected_permission_response(option_id)
+                        if option_id is not None
+                        else _cancelled_permission_response()
+                    )
+                if accept is False and reason:
+                    logger.info("ACP permission rejected by user: %s", reason)
+                p.response_future.set_result(response)
+            return True
+
+    def cancel_pending_acp_permission(self) -> bool:
+        """Cancel a pending ACP permission request during prompt cancellation."""
+        return self.respond_to_pending_acp_permission(accept=None)
+
     def _reset_client_for_turn(
         self,
         on_token: ConversationTokenCallbackType | None,
         on_event: ConversationCallbackType,
+        on_permission_request: Any = None,
     ) -> None:
         """Reset per-turn client state and (re)wire live callbacks.
 
@@ -1612,6 +1916,7 @@ class ACPAgent(AgentBase):
         self._client.on_token = on_token
         self._client.on_event = on_event
         self._client.on_activity = self._on_activity
+        self._client.on_permission_request = on_permission_request
 
     def _cancel_inflight_tool_calls(self) -> None:
         """Emit a terminal ``failed`` ACPToolCallEvent for every tool call
@@ -1660,6 +1965,7 @@ class ACPAgent(AgentBase):
 
     async def _arequest_session_cancel(self) -> None:
         """Async variant of _request_session_cancel that waits for cancel send."""
+        self.cancel_pending_acp_permission()
         if self._conn is None or self._executor is None or self._session_id is None:
             return
         session_id = self._session_id
@@ -1754,6 +2060,7 @@ class ACPAgent(AgentBase):
 
     def _request_session_cancel(self) -> None:
         """Ask the ACP server to cancel the active session prompt."""
+        self.cancel_pending_acp_permission()
         if self._conn is None or self._executor is None or self._session_id is None:
             return
         session_id = self._session_id
@@ -2043,6 +2350,7 @@ class ACPAgent(AgentBase):
         self._client.on_event = None
         self._client.on_token = None
         self._client.on_activity = None
+        self._client.on_permission_request = None
 
     @observe(name="acp_agent.step", ignore_inputs=["conversation", "on_event"])
     def step(
@@ -2219,7 +2527,24 @@ class ACPAgent(AgentBase):
             state.execution_status = ConversationExecutionStatus.FINISHED
             return
 
-        self._reset_client_for_turn(on_token, on_event)
+        async def _permission_handler(
+            options: list[Any],
+            session_id: str,
+            tool_call: Any,
+        ) -> RequestPermissionResponse:
+            return await self._handle_permission_request(
+                options=options,
+                session_id=session_id,
+                tool_call=tool_call,
+                state=state,
+                on_event=on_event,
+            )
+
+        self._reset_client_for_turn(
+            on_token,
+            on_event,
+            on_permission_request=_permission_handler,
+        )
 
         t0 = time.monotonic()
         prompt_future: Future[PromptResponse | None] | None = None
@@ -2269,7 +2594,11 @@ class ACPAgent(AgentBase):
                         )
                         await asyncio.sleep(delay)
                         self._cancel_inflight_tool_calls()
-                        self._reset_client_for_turn(on_token, on_event)
+                        self._reset_client_for_turn(
+                            on_token,
+                            on_event,
+                            on_permission_request=_permission_handler,
+                        )
                     else:
                         raise
                 except ACPRequestError as e:
@@ -2291,7 +2620,11 @@ class ACPAgent(AgentBase):
                         )
                         await asyncio.sleep(delay)
                         self._cancel_inflight_tool_calls()
-                        self._reset_client_for_turn(on_token, on_event)
+                        self._reset_client_for_turn(
+                            on_token,
+                            on_event,
+                            on_permission_request=_permission_handler,
+                        )
                     else:
                         raise
 

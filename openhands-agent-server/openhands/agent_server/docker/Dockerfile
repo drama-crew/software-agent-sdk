@@ -369,3 +369,35 @@ RUN chmod +x /usr/local/bin/openhands-agent-server
 # Fix library path to use system GCC libraries instead of bundled ones
 ENV LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 ENTRYPOINT ["tini", "--", "/usr/local/bin/openhands-agent-server"]
+
+############################
+# Target C: binary-minimal-multi-acp
+# Slim multi-ACP sandbox: binary-minimal + three selectable ACP coding agents.
+#   - Claude Code -> claude-agent-acp  (already in base-image-minimal)
+#   - OpenCode    -> opencode acp      (npm: opencode-ai)
+#   - Hermes      -> hermes acp        (pypi: hermes-agent[acp])
+#
+# Select at conversation time via `oh-acp-agent <name>` as the ACP command,
+# e.g. acp_command = ["oh-acp-agent", "opencode"].
+#
+# Built on base-image-minimal, so NO VNC/Desktop/Docker/VSCode/gh (~1.5GB
+# smaller than the full `binary` target). For a full-base equivalent, swap the
+# FROM to `binary`.
+############################
+FROM binary-minimal AS binary-minimal-multi-acp
+ARG USERNAME
+USER root
+# OpenCode (Node CLI): provides `opencode acp`. Uses the base image's Node 22;
+# `npm install -g` drops /usr/local/bin/opencode on PATH.
+RUN npm install -g opencode-ai && opencode --version
+# Hermes (Python CLI): provides `hermes acp`. uv is already in the base image;
+# install into the system environment so the `hermes` console script lands on
+# PATH (/usr/local/bin).
+RUN uv pip install --system "hermes-agent[acp]" && hermes --version
+# Unified selector across all three agents.
+COPY openhands-agent-server/openhands/agent_server/docker/oh-acp-agent /usr/local/bin/oh-acp-agent
+RUN chmod +x /usr/local/bin/oh-acp-agent
+USER ${USERNAME}
+# ENTRYPOINT and LD_LIBRARY_PATH are inherited from binary-minimal: the
+# container still runs the agent-server; oh-acp-agent is invoked by it as the
+# ACP command, not as PID 1.

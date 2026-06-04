@@ -1516,6 +1516,22 @@ class LocalConversation(BaseConversation):
                 self._on_event(rejection_event)
                 logger.info(f"Rejected pending action: {action_event} - {reason}")
 
+    def respond_to_pending_acp_permission(
+        self,
+        *,
+        accept: bool,
+        reason: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> bool:
+        """Resolve an ACP permission request that is blocking an active prompt."""
+        if not isinstance(self.agent, ACPAgent):
+            return False
+        return self.agent.respond_to_pending_acp_permission(
+            accept=accept,
+            reason=reason,
+            tool_call_id=tool_call_id,
+        )
+
     def _emit_orphaned_action_errors(self) -> None:
         """Emit ``AgentErrorEvent`` for actions that have no observation.
 

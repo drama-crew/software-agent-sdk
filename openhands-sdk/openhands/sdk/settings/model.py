@@ -1085,6 +1085,31 @@ class ACPAgentSettings(AgentSettingsBase):
             ).model_dump(),
         },
     )
+    acp_approval_mode: Literal[
+        "ask_always",
+        "auto_approve_all",
+        "auto_approve_edits_only",
+        "reject_all",
+    ] = Field(
+        default="ask_always",
+        description=(
+            "How ACP permission requests are answered: 'ask_always' (prompt the "
+            "user, default), 'auto_approve_all' (approve every request), "
+            "'auto_approve_edits_only' (auto-approve edit/read, ask otherwise), "
+            "or 'reject_all'."
+        ),
+        json_schema_extra={
+            SETTINGS_METADATA_KEY: SettingsFieldMetadata(
+                label="ACP approval mode",
+                prominence=SettingProminence.MINOR,
+            ).model_dump(),
+            SETTINGS_SECTION_METADATA_KEY: SettingsSectionMetadata(
+                key="acp",
+                label="ACP (Agent Client Protocol)",
+                variant="acp",
+            ).model_dump(),
+        },
+    )
     llm: LLM = Field(
         default_factory=_default_llm_settings,
         description=(
@@ -1218,6 +1243,7 @@ class ACPAgentSettings(AgentSettingsBase):
             acp_env=self.resolve_acp_env(),
             acp_model=self.acp_model,
             acp_session_mode=self.acp_session_mode,
+            acp_approval_mode=self.acp_approval_mode,
             acp_prompt_timeout=self.acp_prompt_timeout,
             agent_context=self.agent_context,
         )

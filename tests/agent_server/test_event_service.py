@@ -1223,6 +1223,31 @@ class TestEventServiceRespondToConfirmation:
         event_service.run.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("accept", [True, False])
+    async def test_respond_to_confirmation_resolves_pending_acp_permission(
+        self, event_service, accept
+    ):
+        """ACP permission responses should resolve the running prompt, not rerun."""
+        conversation = MagicMock()
+        conversation.agent = ACPAgent(acp_command=["echo", "test"])
+        conversation.respond_to_pending_acp_permission = MagicMock(return_value=True)
+        event_service._conversation = conversation
+        event_service.run = AsyncMock()
+        event_service.reject_pending_actions = AsyncMock()
+
+        request = ConfirmationResponseRequest(accept=accept, reason="user choice")
+
+        await event_service.respond_to_confirmation(request)
+
+        conversation.respond_to_pending_acp_permission.assert_called_once_with(
+            accept=accept,
+            reason="user choice",
+            tool_call_id=None,
+        )
+        event_service.run.assert_not_awaited()
+        event_service.reject_pending_actions.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_reject_pending_actions_inactive_service(self, event_service):
         """Rejecting pending actions should fail when service is inactive."""
         event_service._conversation = None
