@@ -49,8 +49,6 @@ from acp.schema import (
 )
 from acp.task.queue import InMemoryMessageQueue
 from acp.transports import default_environment
-
-from openhands.sdk.agent.acp_backpressure import make_bounded_dispatcher_factory
 from pydantic import (
     Field,
     PrivateAttr,
@@ -60,6 +58,7 @@ from pydantic import (
     field_validator,
 )
 
+from openhands.sdk.agent.acp_backpressure import make_bounded_dispatcher_factory
 from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context import AgentContext

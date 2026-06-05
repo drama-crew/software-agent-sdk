@@ -6,8 +6,10 @@ with no concurrency cap, so a degenerate chunk flood (~360/s) piles up tasks +
 message copies until OOM. We cap notification concurrency with a semaphore
 acquired *inside the dispatch loop*: when the cap is hit the loop blocks, the
 (bounded) queue fills, and publish() blocks the receive loop -- backpressure all
-the way to the subprocess stdout. Requests stay concurrent so permission
-round-trips never deadlock.
+the way to the subprocess stdout. Requests are not gated by this semaphore, so
+once dispatched they run concurrently; under sustained notification saturation a
+request may queue behind in-flight notifications until a slot frees, but cannot
+deadlock.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from acp.task.dispatcher import (
 from acp.task.queue import MessageQueue
 from acp.task.state import MessageStateStore
 from acp.task.supervisor import TaskSupervisor
+
 
 DEFAULT_MAX_CONCURRENT_NOTIFICATIONS = 8
 
