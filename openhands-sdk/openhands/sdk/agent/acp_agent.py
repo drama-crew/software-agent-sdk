@@ -2223,7 +2223,22 @@ class ACPAgent(AgentBase):
                 await result
 
         try:
-            self._executor.portal.start_task_soon(_cancel)
+            # The output-cap callback fires this from the portal *event-loop
+            # thread* (``session_update`` -> ``_account_output_bytes`` ->
+            # ``on_output_cap_exceeded`` all run on that loop). Calling
+            # ``portal.start_task_soon`` from the loop thread raises
+            # ``RuntimeError`` ("cannot be called from the event loop thread"),
+            # which the broad ``except`` below would swallow -> ``conn.cancel``
+            # would never be sent and the runaway turn keeps streaming until OOM.
+            # So when a loop is already running on this thread, schedule directly
+            # on it; only fall back to the cross-thread portal hand-off for
+            # genuine non-loop callers (sync ``step``'s ``TimeoutError`` branch
+            # runs on the caller thread, where there is no running loop).
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_cancel())
+            except RuntimeError:
+                self._executor.portal.start_task_soon(_cancel)
         except Exception:
             logger.warning("Failed to send ACP session cancel", exc_info=True)
 
