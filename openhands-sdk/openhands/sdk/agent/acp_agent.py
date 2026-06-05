@@ -47,7 +47,10 @@ from acp.schema import (
     ToolCallStart,
     UsageUpdate,
 )
+from acp.task.queue import InMemoryMessageQueue
 from acp.transports import default_environment
+
+from openhands.sdk.agent.acp_backpressure import make_bounded_dispatcher_factory
 from pydantic import (
     Field,
     PrivateAttr,
@@ -220,6 +223,17 @@ _ENV_CONFLICT_MAP: dict[str, frozenset[str]] = {
 # JSON-RPC payloads; the long-term fix is protocol-level chunking/streaming
 # for large tool output.
 _STREAM_READER_LIMIT: int = 100 * 1024 * 1024  # 100 MiB
+
+# Backpressure on the ACP message stream to prevent unbounded memory growth
+# (the sandbox agent-server has been OOM-killed at 2 GiB by a degenerate
+# opencode chunk flood).  The vendored acp dispatcher is fire-and-forget with
+# an unbounded queue; we cap the message queue depth and notification
+# concurrency so a runaway producer is throttled at its stdout instead of
+# piling up tasks + message copies in memory.  Both are env-overridable.
+_ACP_QUEUE_MAXSIZE: int = int(os.environ.get("OH_ACP_QUEUE_MAXSIZE", "512"))
+_ACP_MAX_CONCURRENT_NOTIFICATIONS: int = int(
+    os.environ.get("OH_ACP_MAX_CONCURRENT_NOTIFICATIONS", "8")
+)
 
 # Minimum interval between on_activity heartbeat signals (seconds).
 # Throttled to avoid excessive calls while still keeping the idle timer
@@ -1664,6 +1678,13 @@ class ACPAgent(AgentBase):
                 client,
                 process.stdin,  # write to subprocess
                 filtered_reader,  # read filtered output
+                # Bounded queue + concurrency-capped dispatcher: applies
+                # backpressure on a runaway agent stream so chunk floods are
+                # throttled at the subprocess stdout instead of OOM-ing us.
+                queue=InMemoryMessageQueue(maxsize=_ACP_QUEUE_MAXSIZE),
+                dispatcher_factory=make_bounded_dispatcher_factory(
+                    max_concurrent_notifications=_ACP_MAX_CONCURRENT_NOTIFICATIONS
+                ),
             )
 
             # Track the subprocess/connection on self as soon as they exist, so
