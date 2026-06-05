@@ -24,7 +24,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -715,6 +715,15 @@ class _OpenHandsACPBridge:
         # Permission request sink — set by ACPAgent.astep() for UI-backed
         # turns so session/request_permission waits for user confirmation.
         self.on_permission_request: Any = None
+        # Per-turn output soft-fuse (P0-2). The bridge meters accumulated
+        # message + thought bytes for the current turn; when it exceeds
+        # ``max_turn_output_bytes`` (0 disables) it fires
+        # ``on_output_cap_exceeded`` exactly once so the agent can request
+        # session/cancel and stop a runaway turn before it OOMs the sandbox.
+        self.max_turn_output_bytes: int = 0  # 0 = disabled
+        self._turn_output_bytes: int = 0
+        self._output_cap_triggered: bool = False
+        self.on_output_cap_exceeded: Callable[[], None] | None = None
         self._last_activity_signal: float = float("-inf")
         # Telemetry state from UsageUpdate (persists across turns)
         self._last_cost: float = 0.0  # last cumulative cost seen
@@ -740,8 +749,48 @@ class _OpenHandsACPBridge:
         self.on_permission_request = None
         self._turn_usage_updates.clear()
         self._usage_received.clear()
+        # Per-turn output soft-fuse counter/flag reset for the fresh turn.
+        self._turn_output_bytes = 0
+        self._output_cap_triggered = False
         # Note: telemetry state (_last_cost, _context_window, _last_activity_signal,
         # etc.) is intentionally NOT cleared — it accumulates across turns.
+
+    def _account_output_bytes(self, text: str) -> None:
+        """Meter accumulated output bytes for the turn and trip the soft-fuse.
+
+        No-op when the cap is disabled (``max_turn_output_bytes <= 0``) or has
+        already tripped this turn. On first crossing of the cap it fires
+        ``on_output_cap_exceeded`` once; the callback (ACPAgent's
+        ``_request_session_cancel``) is best-effort and never raised.
+        """
+        if self.max_turn_output_bytes <= 0 or self._output_cap_triggered:
+            return
+        self._turn_output_bytes += len(text.encode("utf-8"))
+        if self._turn_output_bytes > self.max_turn_output_bytes:
+            self._output_cap_triggered = True
+            logger.warning(
+                "ACP turn output exceeded cap (%d > %d bytes); cancelling turn",
+                self._turn_output_bytes,
+                self.max_turn_output_bytes,
+            )
+            if self.on_output_cap_exceeded is not None:
+                try:
+                    self.on_output_cap_exceeded()
+                except Exception:
+                    logger.debug(
+                        "on_output_cap_exceeded callback failed", exc_info=True
+                    )
+
+    def _clear_accumulators(self) -> None:
+        """Clear accumulation lists ONLY (not callbacks).
+
+        Used after a turn finalizes/cancels to avoid retaining a runaway
+        turn's data into the next turn. Unlike ``reset()`` this leaves the
+        live callbacks (``on_event`` etc.) wired.
+        """
+        self.accumulated_text.clear()
+        self.accumulated_thoughts.clear()
+        self.accumulated_tool_calls.clear()
 
     def prepare_usage_sync(self, session_id: str) -> asyncio.Event:
         """Prepare per-turn UsageUpdate synchronization for a session."""
@@ -780,6 +829,7 @@ class _OpenHandsACPBridge:
             if isinstance(update.content, TextContentBlock):
                 text = update.content.text
                 self.accumulated_text.append(text)
+                self._account_output_bytes(text)
                 if self.on_token is not None:
                     try:
                         self.on_token(text)
@@ -789,6 +839,7 @@ class _OpenHandsACPBridge:
         elif isinstance(update, AgentThoughtChunk):
             if isinstance(update.content, TextContentBlock):
                 self.accumulated_thoughts.append(update.content.text)
+                self._account_output_bytes(update.content.text)
         elif isinstance(update, UsageUpdate):
             # Store the update for step()/ask_agent() to process in one place.
             self._context_window = update.size
@@ -1129,6 +1180,15 @@ class ACPAgent(AgentBase):
             "- 'auto_approve_edits_only': auto-approve non-destructive tool "
             "kinds (edit, read) and still ask for 'execute'/'fetch'/'other'.\n"
             "- 'reject_all': auto-reject every request (safety / testing)."
+        ),
+    )
+    max_turn_output_bytes: int = Field(
+        default_factory=lambda: int(
+            os.environ.get("OH_ACP_MAX_TURN_OUTPUT_BYTES", str(8 * 1024 * 1024))
+        ),
+        description=(
+            "Cap on accumulated output bytes per ACP turn; 0 disables. "
+            "Over cap triggers session/cancel."
         ),
     )
 
@@ -2005,6 +2065,10 @@ class ACPAgent(AgentBase):
         self._client.on_event = on_event
         self._client.on_activity = self._on_activity
         self._client.on_permission_request = on_permission_request
+        # Arm the per-turn output soft-fuse: over cap, the bridge calls
+        # session/cancel to stop a runaway turn before it OOMs the sandbox.
+        self._client.max_turn_output_bytes = self.max_turn_output_bytes
+        self._client.on_output_cap_exceeded = self._request_session_cancel
 
     def _cancel_inflight_tool_calls(self) -> None:
         """Emit a terminal ``failed`` ACPToolCallEvent for every tool call
@@ -2797,7 +2861,36 @@ class ACPAgent(AgentBase):
                 self._emit_turn_error(e, state, on_event)
             raise
         finally:
+            # If the per-turn output soft-fuse tripped, surface a clear
+            # turn-level error to the UI/RemoteConversation *before*
+            # _clear_turn_callbacks unwires the bridge. Use the local
+            # ``on_event`` param (not self._client.on_event, which is about
+            # to be cleared). Emit on the caller thread under the state lock
+            # like _emit_turn_error does.
+            if (
+                getattr(self._client, "_output_cap_triggered", False)
+                and on_event is not None
+            ):
+                try:
+                    with state:
+                        on_event(
+                            ConversationErrorEvent(
+                                source="agent",
+                                code="ACPOutputCapExceeded",
+                                detail=(
+                                    "Agent output exceeded the per-turn safety "
+                                    "limit and was stopped. Please refine the "
+                                    "request or continue manually."
+                                ),
+                            )
+                        )
+                except Exception:
+                    logger.debug(
+                        "failed to emit output-cap error event", exc_info=True
+                    )
             self._clear_turn_callbacks()
+            if self._client is not None:
+                self._client._clear_accumulators()
 
     def ask_agent(self, question: str) -> str | None:
         """Fork the ACP session, prompt the fork, and return the response."""
