@@ -3036,18 +3036,37 @@ class TestACPToolCallLiveEmission:
         for update in sequence:
             await client.session_update("sess", update)
 
-        # Thought chunks don't fire a callback today — filter to the callback
-        # kinds we drove and confirm arrival order matches the driven sequence.
+        # Thought chunks don't fire a callback today. Message text streams via
+        # on_token AND is flushed as an interleaved assistant MessageEvent
+        # (on_event) right before the next tool call, so "reading " surfaces as
+        # an event between tc-a's progress and tc-b's start. The combined stream
+        # must still match arrival order.
         expected_stream = [
-            "event",  # tc-a start
-            "token",  # text chunk
+            "event",  # tc-a start (no pending text yet -> flush is a no-op)
+            "token",  # text chunk "reading " (streamed)
             "event",  # tc-a progress
+            "event",  # "reading " flushed as interleaved MessageEvent before tc-b
             "event",  # tc-b start
-            "token",  # text chunk
+            "token",  # text chunk "done"
             "event",  # tc-b progress
         ]
         assert [kind for kind, _ in observed] == expected_stream
-        tool_events = [payload for kind, payload in observed if kind == "event"]
+
+        # The interleaved MessageEvent carries the narration that preceded tc-b.
+        message_events = [
+            payload
+            for kind, payload in observed
+            if kind == "event" and isinstance(payload, MessageEvent)
+        ]
+        assert len(message_events) == 1
+        assert message_events[0].llm_message.content[0].text == "reading "
+
+        # Tool-call events still arrive in order (start + progress per call).
+        tool_events = [
+            payload
+            for kind, payload in observed
+            if kind == "event" and isinstance(payload, ACPToolCallEvent)
+        ]
         assert [e.tool_call_id for e in tool_events] == [
             "tc-a",
             "tc-a",

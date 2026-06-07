@@ -702,6 +702,13 @@ class _OpenHandsACPBridge:
         self.accumulated_text: list[str] = []
         self.accumulated_thoughts: list[str] = []
         self.accumulated_tool_calls: list[dict[str, Any]] = []
+        # Index into ``accumulated_text`` of the first chunk not yet flushed as
+        # an interleaved assistant ``MessageEvent``. Text accumulated before a
+        # tool call is flushed (see ``_flush_pending_message``) so narration
+        # *between* tool calls renders in order instead of being collapsed into
+        # the end-of-turn FinishAction; the remaining (trailing) text is taken
+        # by ``take_unflushed_text`` at finalize.
+        self._emitted_text_idx: int = 0
         self.on_token: Any = None  # ConversationTokenCallbackType | None
         # Live event sink — fired from session_update as ACP tool-call
         # updates arrive, so the event stream reflects real subprocess
@@ -743,6 +750,7 @@ class _OpenHandsACPBridge:
         self.accumulated_text.clear()
         self.accumulated_thoughts.clear()
         self.accumulated_tool_calls.clear()
+        self._emitted_text_idx = 0
         self.on_token = None
         self.on_event = None
         self.on_activity = None
@@ -791,6 +799,47 @@ class _OpenHandsACPBridge:
         self.accumulated_text.clear()
         self.accumulated_thoughts.clear()
         self.accumulated_tool_calls.clear()
+        self._emitted_text_idx = 0
+
+    def _flush_pending_message(self) -> None:
+        """Emit assistant text accumulated since the last flush as a MessageEvent.
+
+        Called right before a tool-call event is emitted so the narration the
+        agent produced *before* this tool call renders in order (interleaved),
+        instead of being collapsed into the single end-of-turn FinishAction.
+        No-op when there is no pending text or no live event sink.
+        """
+        if self.on_event is None:
+            return
+        pending = "".join(self.accumulated_text[self._emitted_text_idx :])
+        # Advance the cursor even when the pending text is whitespace-only so we
+        # never re-emit it; only non-blank text produces a visible MessageEvent.
+        self._emitted_text_idx = len(self.accumulated_text)
+        if not pending.strip():
+            return
+        self.on_event(
+            MessageEvent(
+                source="agent",
+                llm_message=Message(
+                    role="assistant", content=[TextContent(text=pending)]
+                ),
+            )
+        )
+
+    def take_unflushed_text(self) -> str:
+        """Return assistant text not yet emitted as a MessageEvent, marking it
+        flushed. Used at turn finalize for the trailing segment (text after the
+        last tool call), which becomes the FinishAction message."""
+        trailing = "".join(self.accumulated_text[self._emitted_text_idx :])
+        self._emitted_text_idx = len(self.accumulated_text)
+        return trailing
+
+    @property
+    def emitted_interleaved_message(self) -> bool:
+        """True if any assistant text has already been flushed as a MessageEvent
+        this turn (so an empty trailing segment must NOT trigger the
+        '(No response)' fallback)."""
+        return self._emitted_text_idx > 0
 
     def prepare_usage_sync(self, session_id: str) -> asyncio.Event:
         """Prepare per-turn UsageUpdate synchronization for a session."""
@@ -860,6 +909,10 @@ class _OpenHandsACPBridge:
             }
             self.accumulated_tool_calls.append(entry)
             logger.debug("ACP tool call start: %s", update.tool_call_id)
+            # Flush any assistant narration that preceded this tool call so it
+            # renders BEFORE the tool card, in order, instead of being collapsed
+            # into the end-of-turn FinishAction.
+            self._flush_pending_message()
             self._emit_tool_call_event(entry)
             self._maybe_signal_activity()
         elif isinstance(update, ToolCallProgress):
@@ -2372,11 +2425,22 @@ class ACPAgent(AgentBase):
         # ACPToolCallEvents were already emitted live from
         # _OpenHandsACPBridge.session_update as each ToolCallStart /
         # ToolCallProgress notification arrived — no end-of-turn fan-out
-        # here. FinishAction closes out the turn below.
-        response_text = "".join(self._client.accumulated_text)
+        # here. Assistant narration that PRECEDED a tool call was likewise
+        # already flushed as interleaved MessageEvents (so it renders between
+        # the tool cards in order); only the TRAILING text after the last tool
+        # call remains for the FinishAction that closes out the turn below.
+        had_interleaved_message = self._client.emitted_interleaved_message
+        response_text = self._client.take_unflushed_text()
         thought_text = "".join(self._client.accumulated_thoughts)
         if not response_text:
-            response_text = "(No response from ACP server)"
+            # Only surface the no-response placeholder when the turn produced no
+            # assistant text at all. If text was already shown as interleaved
+            # MessageEvents, an empty trailing segment must stay empty (the
+            # frontend skips an empty FinishAction bubble) — never overwrite a
+            # real reply with the placeholder.
+            response_text = (
+                "" if had_interleaved_message else "(No response from ACP server)"
+            )
 
         # ACP step() boundaries are full remote assistant turns, not
         # partial planning steps. Emit FinishAction to delimit that
