@@ -20,10 +20,11 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import threading
 import time
 import uuid
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -46,6 +47,7 @@ from acp.schema import (
     ToolCallStart,
     UsageUpdate,
 )
+from acp.task.queue import InMemoryMessageQueue
 from acp.transports import default_environment
 from pydantic import (
     Field,
@@ -56,6 +58,7 @@ from pydantic import (
     field_validator,
 )
 
+from openhands.sdk.agent.acp_backpressure import make_bounded_dispatcher_factory
 from openhands.sdk.agent.acp_models import ACPModelInfo
 from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.context import AgentContext
@@ -91,6 +94,64 @@ from openhands.sdk.utils.pydantic_secrets import (
 
 logger = get_logger(__name__)
 maybe_init_laminar()
+
+# ---------------------------------------------------------------------------
+# Per-kind ACP session map helpers
+# ---------------------------------------------------------------------------
+
+_ACP_KIND_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("claude", "claude"),
+    ("anthropic", "claude"),
+    ("opencode", "opencode"),
+    ("hermes", "hermes"),
+    ("codex", "codex"),
+    ("gemini", "gemini"),
+)
+
+
+def _acp_session_kind(agent_name: str) -> str:
+    """Normalize a runtime ACP agent name to a stable per-kind key used to bucket
+    session ids in agent_state['acp_sessions']. Known agents map to a canonical key;
+    unknown names fall back to a slug; empty -> 'unknown'."""
+    lower = (agent_name or "").lower()
+    for needle, kind in _ACP_KIND_PATTERNS:
+        if needle in lower:
+            return kind
+    slug = re.sub(r"[^a-z0-9]+", "-", lower).strip("-")
+    return slug or "unknown"
+
+
+def _merge_acp_session(
+    agent_state: dict,
+    *,
+    kind: str,
+    session_id: str | None,
+    cwd: str | None,
+) -> dict:
+    """Return a new agent_state with (kind -> {id, cwd}) recorded in 'acp_sessions',
+    keeping legacy single-value keys for back-compat read."""
+    sessions = dict(agent_state.get("acp_sessions") or {})
+    sessions[kind] = {"id": session_id, "cwd": cwd}
+    return {
+        **agent_state,
+        "acp_sessions": sessions,
+        "acp_session_id": session_id,
+        "acp_session_cwd": cwd,
+    }
+
+
+def _read_prior_acp_session(
+    agent_state: dict,
+    *,
+    kind: str,
+) -> tuple[str | None, str | None]:
+    """Read prior (session_id, cwd) for this kind, preferring per-kind 'acp_sessions'
+    map and falling back to legacy single-value keys."""
+    sessions = agent_state.get("acp_sessions") or {}
+    entry = sessions.get(kind)
+    if entry:
+        return entry.get("id"), entry.get("cwd")
+    return agent_state.get("acp_session_id"), agent_state.get("acp_session_cwd")
 
 
 if TYPE_CHECKING:
@@ -161,6 +222,17 @@ _ENV_CONFLICT_MAP: dict[str, frozenset[str]] = {
 # JSON-RPC payloads; the long-term fix is protocol-level chunking/streaming
 # for large tool output.
 _STREAM_READER_LIMIT: int = 100 * 1024 * 1024  # 100 MiB
+
+# Backpressure on the ACP message stream to prevent unbounded memory growth
+# (the sandbox agent-server has been OOM-killed at 2 GiB by a degenerate
+# opencode chunk flood).  The vendored acp dispatcher is fire-and-forget with
+# an unbounded queue; we cap the message queue depth and notification
+# concurrency so a runaway producer is throttled at its stdout instead of
+# piling up tasks + message copies in memory.  Both are env-overridable.
+_ACP_QUEUE_MAXSIZE: int = int(os.environ.get("OH_ACP_QUEUE_MAXSIZE", "512"))
+_ACP_MAX_CONCURRENT_NOTIFICATIONS: int = int(
+    os.environ.get("OH_ACP_MAX_CONCURRENT_NOTIFICATIONS", "8")
+)
 
 # Minimum interval between on_activity heartbeat signals (seconds).
 # Throttled to avoid excessive calls while still keeping the idle timer
@@ -630,6 +702,13 @@ class _OpenHandsACPBridge:
         self.accumulated_text: list[str] = []
         self.accumulated_thoughts: list[str] = []
         self.accumulated_tool_calls: list[dict[str, Any]] = []
+        # Index into ``accumulated_text`` of the first chunk not yet flushed as
+        # an interleaved assistant ``MessageEvent``. Text accumulated before a
+        # tool call is flushed (see ``_flush_pending_message``) so narration
+        # *between* tool calls renders in order instead of being collapsed into
+        # the end-of-turn FinishAction; the remaining (trailing) text is taken
+        # by ``take_unflushed_text`` at finalize.
+        self._emitted_text_idx: int = 0
         self.on_token: Any = None  # ConversationTokenCallbackType | None
         # Live event sink — fired from session_update as ACP tool-call
         # updates arrive, so the event stream reflects real subprocess
@@ -643,6 +722,15 @@ class _OpenHandsACPBridge:
         # Permission request sink — set by ACPAgent.astep() for UI-backed
         # turns so session/request_permission waits for user confirmation.
         self.on_permission_request: Any = None
+        # Per-turn output soft-fuse (P0-2). The bridge meters accumulated
+        # message + thought bytes for the current turn; when it exceeds
+        # ``max_turn_output_bytes`` (0 disables) it fires
+        # ``on_output_cap_exceeded`` exactly once so the agent can request
+        # session/cancel and stop a runaway turn before it OOMs the sandbox.
+        self.max_turn_output_bytes: int = 0  # 0 = disabled
+        self._turn_output_bytes: int = 0
+        self._output_cap_triggered: bool = False
+        self.on_output_cap_exceeded: Callable[[], None] | None = None
         self._last_activity_signal: float = float("-inf")
         # Telemetry state from UsageUpdate (persists across turns)
         self._last_cost: float = 0.0  # last cumulative cost seen
@@ -662,14 +750,96 @@ class _OpenHandsACPBridge:
         self.accumulated_text.clear()
         self.accumulated_thoughts.clear()
         self.accumulated_tool_calls.clear()
+        self._emitted_text_idx = 0
         self.on_token = None
         self.on_event = None
         self.on_activity = None
         self.on_permission_request = None
         self._turn_usage_updates.clear()
         self._usage_received.clear()
+        # Per-turn output soft-fuse counter/flag reset for the fresh turn.
+        self._turn_output_bytes = 0
+        self._output_cap_triggered = False
         # Note: telemetry state (_last_cost, _context_window, _last_activity_signal,
         # etc.) is intentionally NOT cleared — it accumulates across turns.
+
+    def _account_output_bytes(self, text: str) -> None:
+        """Meter accumulated output bytes for the turn and trip the soft-fuse.
+
+        No-op when the cap is disabled (``max_turn_output_bytes <= 0``) or has
+        already tripped this turn. On first crossing of the cap it fires
+        ``on_output_cap_exceeded`` once; the callback (ACPAgent's
+        ``_request_session_cancel``) is best-effort and never raised.
+        """
+        if self.max_turn_output_bytes <= 0 or self._output_cap_triggered:
+            return
+        self._turn_output_bytes += len(text.encode("utf-8"))
+        if self._turn_output_bytes > self.max_turn_output_bytes:
+            self._output_cap_triggered = True
+            logger.warning(
+                "ACP turn output exceeded cap (%d > %d bytes); cancelling turn",
+                self._turn_output_bytes,
+                self.max_turn_output_bytes,
+            )
+            if self.on_output_cap_exceeded is not None:
+                try:
+                    self.on_output_cap_exceeded()
+                except Exception:
+                    logger.debug(
+                        "on_output_cap_exceeded callback failed", exc_info=True
+                    )
+
+    def _clear_accumulators(self) -> None:
+        """Clear accumulation lists ONLY (not callbacks).
+
+        Used after a turn finalizes/cancels to avoid retaining a runaway
+        turn's data into the next turn. Unlike ``reset()`` this leaves the
+        live callbacks (``on_event`` etc.) wired.
+        """
+        self.accumulated_text.clear()
+        self.accumulated_thoughts.clear()
+        self.accumulated_tool_calls.clear()
+        self._emitted_text_idx = 0
+
+    def _flush_pending_message(self) -> None:
+        """Emit assistant text accumulated since the last flush as a MessageEvent.
+
+        Called right before a tool-call event is emitted so the narration the
+        agent produced *before* this tool call renders in order (interleaved),
+        instead of being collapsed into the single end-of-turn FinishAction.
+        No-op when there is no pending text or no live event sink.
+        """
+        if self.on_event is None:
+            return
+        pending = "".join(self.accumulated_text[self._emitted_text_idx :])
+        # Advance the cursor even when the pending text is whitespace-only so we
+        # never re-emit it; only non-blank text produces a visible MessageEvent.
+        self._emitted_text_idx = len(self.accumulated_text)
+        if not pending.strip():
+            return
+        self.on_event(
+            MessageEvent(
+                source="agent",
+                llm_message=Message(
+                    role="assistant", content=[TextContent(text=pending)]
+                ),
+            )
+        )
+
+    def take_unflushed_text(self) -> str:
+        """Return assistant text not yet emitted as a MessageEvent, marking it
+        flushed. Used at turn finalize for the trailing segment (text after the
+        last tool call), which becomes the FinishAction message."""
+        trailing = "".join(self.accumulated_text[self._emitted_text_idx :])
+        self._emitted_text_idx = len(self.accumulated_text)
+        return trailing
+
+    @property
+    def emitted_interleaved_message(self) -> bool:
+        """True if any assistant text has already been flushed as a MessageEvent
+        this turn (so an empty trailing segment must NOT trigger the
+        '(No response)' fallback)."""
+        return self._emitted_text_idx > 0
 
     def prepare_usage_sync(self, session_id: str) -> asyncio.Event:
         """Prepare per-turn UsageUpdate synchronization for a session."""
@@ -708,6 +878,7 @@ class _OpenHandsACPBridge:
             if isinstance(update.content, TextContentBlock):
                 text = update.content.text
                 self.accumulated_text.append(text)
+                self._account_output_bytes(text)
                 if self.on_token is not None:
                     try:
                         self.on_token(text)
@@ -717,6 +888,7 @@ class _OpenHandsACPBridge:
         elif isinstance(update, AgentThoughtChunk):
             if isinstance(update.content, TextContentBlock):
                 self.accumulated_thoughts.append(update.content.text)
+                self._account_output_bytes(update.content.text)
         elif isinstance(update, UsageUpdate):
             # Store the update for step()/ask_agent() to process in one place.
             self._context_window = update.size
@@ -737,6 +909,10 @@ class _OpenHandsACPBridge:
             }
             self.accumulated_tool_calls.append(entry)
             logger.debug("ACP tool call start: %s", update.tool_call_id)
+            # Flush any assistant narration that preceded this tool call so it
+            # renders BEFORE the tool card, in order, instead of being collapsed
+            # into the end-of-turn FinishAction.
+            self._flush_pending_message()
             self._emit_tool_call_event(entry)
             self._maybe_signal_activity()
         elif isinstance(update, ToolCallProgress):
@@ -1059,6 +1235,15 @@ class ACPAgent(AgentBase):
             "- 'reject_all': auto-reject every request (safety / testing)."
         ),
     )
+    max_turn_output_bytes: int = Field(
+        default_factory=lambda: int(
+            os.environ.get("OH_ACP_MAX_TURN_OUTPUT_BYTES", str(8 * 1024 * 1024))
+        ),
+        description=(
+            "Cap on accumulated output bytes per ACP turn; 0 disables. "
+            "Over cap triggers session/cancel."
+        ),
+    )
 
     def model_post_init(self, __context: object) -> None:
         super().model_post_init(__context)
@@ -1348,7 +1533,9 @@ class ACPAgent(AgentBase):
         # A prior session id in agent_state means we may be resuming; used by
         # ``truly_resumed`` below to decide whether the model state reported
         # for this launch describes the resumed session or a fresh one.
-        prior_session_id = state.agent_state.get("acp_session_id")
+        # Use per-kind map when available, fall back to legacy keys.
+        _init_kind = _acp_session_kind(self._agent_name) if self._agent_name else _acp_session_kind(str(self.acp_command[-1]))
+        prior_session_id, _ = _read_prior_acp_session(state.agent_state, kind=_init_kind)
         # ``acp_suffix_installed`` is persisted by
         # ``_commit_suffix_installation`` only after the first prompt has
         # actually returned successfully, so on resume we know whether the
@@ -1402,12 +1589,17 @@ class ACPAgent(AgentBase):
         # in a different working directory would at best silently miss the
         # prior session and at worst load a different session that happens to
         # exist at the new cwd.
+        kind = _acp_session_kind(self._agent_name)
+        merged = _merge_acp_session(
+            state.agent_state,
+            kind=kind,
+            session_id=self._session_id,
+            cwd=self._working_dir,
+        )
         new_agent_state = {
-            **state.agent_state,
+            **merged,
             "acp_agent_name": self._agent_name,
             "acp_agent_version": self._agent_version,
-            "acp_session_id": self._session_id,
-            "acp_session_cwd": self._working_dir,
             # Static provider capability — persisted so cold reads of the
             # conversation list can tell the picker whether to offer live
             # switching without re-detecting the provider server-side.
@@ -1551,8 +1743,10 @@ class ACPAgent(AgentBase):
         # ACP servers key persistence by ``cwd``; if the workspace moved we
         # drop the id so we don't accidentally resume (or silently load) a
         # session the server associates with a different directory.
-        prior_session_id: str | None = state.agent_state.get("acp_session_id")
-        prior_session_cwd: str | None = state.agent_state.get("acp_session_cwd")
+        # self._agent_name is empty here (set only after _init completes), so
+        # fall back to the last element of acp_command as the kind hint.
+        _kind = _acp_session_kind(self._agent_name) if self._agent_name else _acp_session_kind(str(self.acp_command[-1]))
+        prior_session_id, prior_session_cwd = _read_prior_acp_session(state.agent_state, kind=_kind)
         if prior_session_id is not None and prior_session_cwd not in (
             None,
             working_dir,
@@ -1596,6 +1790,13 @@ class ACPAgent(AgentBase):
                 client,
                 process.stdin,  # write to subprocess
                 filtered_reader,  # read filtered output
+                # Bounded queue + concurrency-capped dispatcher: applies
+                # backpressure on a runaway agent stream so chunk floods are
+                # throttled at the subprocess stdout instead of OOM-ing us.
+                queue=InMemoryMessageQueue(maxsize=_ACP_QUEUE_MAXSIZE),
+                dispatcher_factory=make_bounded_dispatcher_factory(
+                    max_concurrent_notifications=_ACP_MAX_CONCURRENT_NOTIFICATIONS
+                ),
             )
 
             # Track the subprocess/connection on self as soon as they exist, so
@@ -1917,6 +2118,10 @@ class ACPAgent(AgentBase):
         self._client.on_event = on_event
         self._client.on_activity = self._on_activity
         self._client.on_permission_request = on_permission_request
+        # Arm the per-turn output soft-fuse: over cap, the bridge calls
+        # session/cancel to stop a runaway turn before it OOMs the sandbox.
+        self._client.max_turn_output_bytes = self.max_turn_output_bytes
+        self._client.on_output_cap_exceeded = self._request_session_cancel
 
     def _cancel_inflight_tool_calls(self) -> None:
         """Emit a terminal ``failed`` ACPToolCallEvent for every tool call
@@ -2071,7 +2276,22 @@ class ACPAgent(AgentBase):
                 await result
 
         try:
-            self._executor.portal.start_task_soon(_cancel)
+            # The output-cap callback fires this from the portal *event-loop
+            # thread* (``session_update`` -> ``_account_output_bytes`` ->
+            # ``on_output_cap_exceeded`` all run on that loop). Calling
+            # ``portal.start_task_soon`` from the loop thread raises
+            # ``RuntimeError`` ("cannot be called from the event loop thread"),
+            # which the broad ``except`` below would swallow -> ``conn.cancel``
+            # would never be sent and the runaway turn keeps streaming until OOM.
+            # So when a loop is already running on this thread, schedule directly
+            # on it; only fall back to the cross-thread portal hand-off for
+            # genuine non-loop callers (sync ``step``'s ``TimeoutError`` branch
+            # runs on the caller thread, where there is no running loop).
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_cancel())
+            except RuntimeError:
+                self._executor.portal.start_task_soon(_cancel)
         except Exception:
             logger.warning("Failed to send ACP session cancel", exc_info=True)
 
@@ -2205,11 +2425,22 @@ class ACPAgent(AgentBase):
         # ACPToolCallEvents were already emitted live from
         # _OpenHandsACPBridge.session_update as each ToolCallStart /
         # ToolCallProgress notification arrived — no end-of-turn fan-out
-        # here. FinishAction closes out the turn below.
-        response_text = "".join(self._client.accumulated_text)
+        # here. Assistant narration that PRECEDED a tool call was likewise
+        # already flushed as interleaved MessageEvents (so it renders between
+        # the tool cards in order); only the TRAILING text after the last tool
+        # call remains for the FinishAction that closes out the turn below.
+        had_interleaved_message = self._client.emitted_interleaved_message
+        response_text = self._client.take_unflushed_text()
         thought_text = "".join(self._client.accumulated_thoughts)
         if not response_text:
-            response_text = "(No response from ACP server)"
+            # Only surface the no-response placeholder when the turn produced no
+            # assistant text at all. If text was already shown as interleaved
+            # MessageEvents, an empty trailing segment must stay empty (the
+            # frontend skips an empty FinishAction bubble) — never overwrite a
+            # real reply with the placeholder.
+            response_text = (
+                "" if had_interleaved_message else "(No response from ACP server)"
+            )
 
         # ACP step() boundaries are full remote assistant turns, not
         # partial planning steps. Emit FinishAction to delimit that
@@ -2709,7 +2940,36 @@ class ACPAgent(AgentBase):
                 self._emit_turn_error(e, state, on_event)
             raise
         finally:
+            # If the per-turn output soft-fuse tripped, surface a clear
+            # turn-level error to the UI/RemoteConversation *before*
+            # _clear_turn_callbacks unwires the bridge. Use the local
+            # ``on_event`` param (not self._client.on_event, which is about
+            # to be cleared). Emit on the caller thread under the state lock
+            # like _emit_turn_error does.
+            if (
+                getattr(self._client, "_output_cap_triggered", False)
+                and on_event is not None
+            ):
+                try:
+                    with state:
+                        on_event(
+                            ConversationErrorEvent(
+                                source="agent",
+                                code="ACPOutputCapExceeded",
+                                detail=(
+                                    "Agent output exceeded the per-turn safety "
+                                    "limit and was stopped. Please refine the "
+                                    "request or continue manually."
+                                ),
+                            )
+                        )
+                except Exception:
+                    logger.debug(
+                        "failed to emit output-cap error event", exc_info=True
+                    )
             self._clear_turn_callbacks()
+            if self._client is not None:
+                self._client._clear_accumulators()
 
     def ask_agent(self, question: str) -> str | None:
         """Fork the ACP session, prompt the fork, and return the response."""

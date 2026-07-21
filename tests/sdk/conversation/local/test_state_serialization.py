@@ -1369,6 +1369,54 @@ def test_context_manager_batches_saves() -> None:
     assert save_count == 2
 
 
+def test_create_seeds_initial_agent_state_for_new_conversation(tmp_path: Path):
+    """initial_agent_state is seeded into a brand-new ConversationState."""
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test-key"), usage_id="test-llm")
+    agent = Agent(llm=llm, tools=[])
+    conv_id = uuid.UUID("12345678-1234-5678-9abc-123456789ee1")
+    persist_path = LocalConversation.get_persistence_dir(tmp_path, conv_id)
+
+    seed = {"acp_sessions": {"opencode": {"id": "seed", "cwd": "/w"}}}
+    state = ConversationState.create(
+        workspace=LocalWorkspace(working_dir="/tmp"),
+        persistence_dir=persist_path,
+        agent=agent,
+        id=conv_id,
+        initial_agent_state=seed,
+    )
+
+    assert state.agent_state["acp_sessions"]["opencode"]["id"] == "seed"
+
+
+def test_create_ignores_seed_when_base_state_exists(tmp_path: Path):
+    """When base_state.json already exists, initial_agent_state is NOT applied."""
+    llm = LLM(model="gpt-4o-mini", api_key=SecretStr("test-key"), usage_id="test-llm")
+    agent = Agent(llm=llm, tools=[])
+    conv_id = uuid.UUID("12345678-1234-5678-9abc-123456789ee2")
+    persist_path = LocalConversation.get_persistence_dir(tmp_path, conv_id)
+
+    # First create: no seed, then manually set agent_state to "REAL" marker
+    state = ConversationState.create(
+        workspace=LocalWorkspace(working_dir="/tmp"),
+        persistence_dir=persist_path,
+        agent=agent,
+        id=conv_id,
+    )
+    state.agent_state = {"acp_sessions": {"opencode": {"id": "REAL", "cwd": "/w"}}}
+    # autosave triggers on assignment — base_state.json now has "REAL"
+
+    # Second create with a different seed — must NOT override because base_state.json exists
+    resumed = ConversationState.create(
+        workspace=LocalWorkspace(working_dir="/tmp"),
+        persistence_dir=persist_path,
+        agent=agent,
+        id=conv_id,
+        initial_agent_state={"acp_sessions": {"opencode": {"id": "SEED", "cwd": "/w"}}},
+    )
+
+    assert resumed.agent_state["acp_sessions"]["opencode"]["id"] == "REAL"
+
+
 def test_v1_17_0_conversation_with_mcp_config_restores(tmp_path: Path) -> None:
     """Test resuming a legacy conversation that persisted agent.mcp_config."""
     fixture_path = (

@@ -138,12 +138,16 @@ def test_acp_agent_settings_export_schema_has_acp_section() -> None:
         "acp_model",
         "acp_session_mode",
         "acp_prompt_timeout",
+        "acp_approval_mode",
     }
     # Server picker + model are both critical — users pick server then
     # model. Raw command is a minor override for power users.
     assert acp_fields["acp_server"].prominence is SettingProminence.CRITICAL
     assert acp_fields["acp_model"].prominence is SettingProminence.CRITICAL
     assert acp_fields["acp_command"].prominence is SettingProminence.MINOR
+    # Approval mode is a minor behavioural override (default 'ask_always'),
+    # like acp_session_mode / acp_prompt_timeout.
+    assert acp_fields["acp_approval_mode"].prominence is SettingProminence.MINOR
 
 
 def test_conversation_settings_export_schema_groups_sections() -> None:

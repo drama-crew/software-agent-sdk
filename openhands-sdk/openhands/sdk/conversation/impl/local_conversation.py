@@ -5,7 +5,7 @@ import copy
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TypeGuard
+from typing import Any, TypeGuard
 
 from openhands.sdk.agent.acp_agent import ACPAgent
 from openhands.sdk.agent.base import AgentBase
@@ -137,6 +137,7 @@ class LocalConversation(BaseConversation):
         cipher: Cipher | None = None,
         tags: dict[str, str] | None = None,
         user_id: str | None = None,
+        agent_state: dict[str, Any] | None = None,
         **_: object,
     ):
         """Initialize the conversation.
@@ -219,6 +220,7 @@ class LocalConversation(BaseConversation):
             stuck_detection=stuck_detection,
             cipher=cipher,
             tags=tags,
+            initial_agent_state=agent_state or None,
         )
 
         self._pin_prompt_cache_key()

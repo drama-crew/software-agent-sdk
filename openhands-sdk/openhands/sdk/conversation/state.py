@@ -284,6 +284,7 @@ class ConversationState(OpenHandsModel):
         stuck_detection: bool = True,
         cipher: Cipher | None = None,
         tags: dict[str, str] | None = None,
+        initial_agent_state: dict[str, Any] | None = None,
     ) -> "ConversationState":
         """Create a new conversation state or resume from persistence.
 
@@ -313,6 +314,10 @@ class ConversationState(OpenHandsModel):
                     are redacted (lost) on serialization.
             tags: Optional key-value tags for the conversation. Keys must be
                   lowercase alphanumeric, values up to 256 characters.
+            initial_agent_state: Optional dict to seed into agent_state for a
+                  NEW conversation only. Ignored when resuming from persisted
+                  state. Useful for injecting an ACP session map after a
+                  sandbox rebuild so the agent can resume an existing session.
 
         Returns:
             ConversationState ready for use
@@ -389,6 +394,9 @@ class ConversationState(OpenHandsModel):
         state._events = EventLog(file_store, dir_path=EVENTS_DIR)
         state._cipher = cipher
         state.stats = ConversationStats()
+
+        if initial_agent_state:
+            state.agent_state = {**state.agent_state, **initial_agent_state}
 
         state._save_base_state(file_store)  # initial snapshot
         state._autosave_enabled = True
