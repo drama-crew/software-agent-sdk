@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import os
 import threading
@@ -1609,7 +1610,18 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     **{**self._aws_kwargs(), **kwargs},
                 )
                 if enable_streaming and on_token is not None:
-                    assert isinstance(ret, CustomStreamWrapper)
+                    # litellm returns a bare (sync) generator instead of a
+                    # ``CustomStreamWrapper`` when ``api_base`` points at
+                    # another litellm proxy; it yields the same
+                    # ``ModelResponseStream`` chunks, so accept either --
+                    # the drain loop below is identical for both.
+                    if not (
+                        isinstance(ret, CustomStreamWrapper)
+                        or inspect.isgenerator(ret)
+                    ):
+                        raise TypeError(
+                            f"Expected a streaming iterator, got {type(ret)}"
+                        )
                     chunks = []
                     for chunk in ret:
                         on_token(chunk)
@@ -1668,7 +1680,18 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     **{**self._aws_kwargs(), **kwargs},
                 )
                 if enable_streaming and on_token is not None:
-                    assert isinstance(ret, CustomStreamWrapper)
+                    # litellm returns a bare async generator instead of a
+                    # ``CustomStreamWrapper`` when ``api_base`` points at
+                    # another litellm proxy; it yields the same
+                    # ``ModelResponseStream`` chunks, so accept either --
+                    # the drain loop below is identical for both.
+                    if not (
+                        isinstance(ret, CustomStreamWrapper)
+                        or inspect.isasyncgen(ret)
+                    ):
+                        raise TypeError(
+                            f"Expected a streaming iterator, got {type(ret)}"
+                        )
                     chunks = []
                     async for chunk in ret:
                         await _invoke_token_callback(on_token, chunk)
